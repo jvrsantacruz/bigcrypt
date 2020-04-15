@@ -9,10 +9,12 @@ import sys
 import copy
 import logging
 import mmap
+from enum import Enum
 from argparse import ArgumentParser
 from pathlib import Path
 from multiprocessing import Pool
 from multiprocessing.pool import ThreadPool
+import fallocate
 import collections
 from typing import Iterator, IO, List, Tuple, Callable, Optional
 
@@ -251,9 +253,10 @@ class FileWriter(Writer):
 
 
 class MappedWriter(Writer):
-    def __init__(self, stream: IO[bytes]):
+    def __init__(self, stream: IO[bytes], total_size: int):
         fileno = stream.fileno()
-        total_size = os.fstat(fileno).st_size
+        # Make sure the target file is the right size
+        fallocate.fallocate(fileno, 0, total_size)
         self.mem_id = memory_registry.add(
             mmap.mmap(fileno, total_size, mmap.MAP_SHARED, mmap.PROT_WRITE)
         )
@@ -268,11 +271,12 @@ class MappedWriter(Writer):
         )
 
 
-class MappedAnonWriter(MappedWriter):
+class MappedAnonWriter(Writer):
     def __init__(self, total_size: int):
-        self.mem = mmap.mmap(
+        mem = mmap.mmap(
             -1, total_size, mmap.SHARED, mmap.PROT_READ | mmap.PROT_WRITE
         )
+        self.mem_id = memory_registry.add(mem)
 
 
 def printer(block: Block) -> Block:
@@ -284,126 +288,151 @@ def consume(iterable):
     collections.deque(iterable, maxlen=0)
 
 
-class Source:
-    default_block_size = 64 * 2**20
+class Storage:
+    max_blocks = None
 
     def stream(self, *args, **kwargs) -> IO[bytes]:
         pass
 
     @property
     def block_size(self):
-        return self.default_block_size
+        return
+
+    @property
+    def size(self):
+        return
 
 
-class FileSource(Source):
+class S3Storage(Storage):
+    max_blocks = 10000
+
+
+class FileStorage(Storage):
     def __init__(self, path: Path):
         self.path = path
+
+    def stream(self, *args, **kwargs):
+        return self.path.open(*args, **kwargs)
 
     @property
     def size(self) -> int:
         return self.path.stat().st_size
 
-    @property
-    def total_blocks(self) -> int:
-        return self.size // self.block_size + \
-            int(self.size % self.block_size != 0)
 
+class Source:
+    default_block_size = 64 * 2**20 # 64 MiB
 
-class EncryptedSource(Source):
-    def __init__(self, source: Source, cipher: Cipher):
-        self.source = source
+    def __init__(self, storage: Storage, cipher: Cipher):
+        self.storage = storage
         self.cipher = cipher
 
-    @property
-    def size(self) -> int:
-        return self.source.size \
-            + self.cipher.block_overhead * self.total_blocks
+    def stream(self, *args, **kwargs):
+        return self.storage.stream(*args, **kwargs)
 
     @property
     def block_size(self) -> int:
-        return self.source.block_size + self.cipher.block_overhead
+        raise NotImplementedError()
 
     @property
-    def total_blocks(self) -> int:
-        return self.source.total_blocks
+    def size(self) -> Optional[int]:
+        raise NotImplementedError()
+
+    @property
+    def total_blocks(self) -> Optional[int]:
+        if self.size is not None:
+            return self.size // self.block_size +\
+                0 if self.size % self.block_size == 0 else 1
+
+    @property
+    def total_overhead(self) -> Optional[int]:
+        if self.total_blocks is not None:
+            return self.total_blocks * self.cipher.block_overhead
 
 
-class State:
+class EncryptedSource(Source):
     def __init__(
         self,
-        key: Optional[bytes]=None,
-        nonce: Optional[bytes]=None,
-        block_size: Optional[int]=None,
-        pool_size: Optional[int]=None,
+        storage: Storage,
+        cipher: Cipher,
+        origin: 'DecryptedSource'=None
     ):
-        self.bytes_cipher = Cipher(key)
-        self.nonce = Nonce(nonce)
-        self.block_size = block_size or (64 * 2**20)
-        self.pool_size = pool_size or 10
-        self.cipher = BlockCipher(self.bytes_cipher, self.nonce)
-        self.plain_block_size = self.block_size
-        self.cipher_block_size = \
-            self.block_size + self.cipher.block_overhead
+        super().__init__(storage, cipher)
+        self.origin = origin
 
-    def total_cipher_size(self, plain_size: int) -> int:
-        overhead = self.total_overhead(plain_size, self.plain_block_size)
-        return plain_size + overhead
+    @property
+    def block_size(self) -> int:
+        if not self.origin:
+            return self.default_block_size
+        return self.origin.block_size + self.cipher.block_overhead
 
-    def total_plain_size(self, cipher_size: int) -> int:
-        overhead = self.total_overhead(cipher_size, self.cipher_block_size)
-        return cipher_size - overhead
-
-    def total_overhead(self, total_size: int, block_size: int) -> int:
-        total_blocks = self.total_blocks(total_size, block_size)
-        block_overhead = self.cipher.block_overhead
-        return  total_blocks * block_overhead
-
-    def total_blocks(self, total_size: int, block_size: int) -> int:
-        return total_size // block_size + \
-            int(total_size % block_size != 0)
+    @property
+    def size(self) -> Optional[int]:
+        if not self.origin:
+            return self.storage.size
+        return self.origin.size + \
+            self.origin.total_blocks * self.origin.total_overhead
 
 
-def encrypt_file(source: Path, dest: Path, state: State):
-    chunker = MappedChunker(state.plain_block_size)
+class DecryptedSource(Source):
+    def __init__(
+        self,
+        storage: Storage,
+        cipher: Cipher,
+        origin: EncryptedSource=None
+    ):
+        super().__init__(storage, cipher)
+        self.origin = origin
 
-    with source.open('rb') as source_stream:
+    @property
+    def block_size(self) -> int:
+        base_size = self.default_block_size
+        if self.origin:
+            base_size = self.origin.block_size
+        return base_size - self.cipher.block_overhead
+
+    @property
+    def size(self) -> Optional[int]:
+        if not self.origin:
+            return self.storage.size
+        return self.origin.size -\
+            self.origin.total_blocks * self.cipher.block_overhead
+
+
+class Status(Enum):
+    origin = 1
+    target = 2
+
+
+class Mode(Enum):
+    encrypting = 1
+    decrypting = 2
+
+
+def encrypt(origin: Storage, target: Storage, cipher: Cipher):
+    origin = DecryptedSource(origin, cipher)
+    target = EncryptedSource(target, cipher, origin)
+    return encrypter(origin, target, Mode.encrypting)
+
+
+def decrypt(origin: Storage, target: Storage, cipher: Cipher):
+    origin = EncryptedSource(origin, cipher)
+    target = DecryptedSource(target, cipher, origin)
+    return encrypter(origin, target, Mode.decrypting)
+
+
+def encrypter(origin: Source, target: Source, mode: Mode):
+    chunker = MappedChunker(origin.block_size)
+
+    with origin.stream('rb') as source_stream:
         blocks = chunker(source_stream)
 
-        with dest.open('wb+') as dest_stream:
-            import fallocate
-            fallocate.fallocate(
-                dest_stream.fileno(),
-                0,
-                state.total_cipher_size(source.stat().st_size)
-            )
-            writer = MappedWriter(dest_stream)
-            encrypter = ProcessBlockProcessor(Actions([
-                state.cipher.encrypt,
-                writer,
-            ]))
-            blocks = encrypter(blocks)
-            blocks = map(printer, blocks)
-            consume(blocks)
-
-
-def decrypt_file(source: Path, dest: Path, state: State):
-    chunker = MappedChunker(state.cipher_block_size)
-    with source.open('rb') as source_stream:
-        blocks = chunker(source_stream)
-
-        with dest.open('wb+') as dest_stream:
-            import fallocate
-            fallocate.fallocate(
-                dest_stream.fileno(),
-                0,
-                state.total_plain_size(source.stat().st_size)
-            )
-            writer = MappedWriter(dest_stream)
-            decrypter = ProcessBlockProcessor(Actions([
-                state.cipher.decrypt, writer
-            ]))
-
-            blocks = decrypter(blocks)
+        with target.stream('wb+') as dest_stream:
+            writer = MappedWriter(dest_stream, target.size)
+            function = origin.cipher.encrypt \
+                if mode == Mode.encrypting else origin.cipher.decrypt
+            actions = Actions([function, writer])
+            processor = BlockProcessor(actions)
+            blocks = processor(blocks)
             blocks = map(printer, blocks)
             consume(blocks)
 
@@ -440,9 +469,16 @@ def parse_args():
 
 def main():
     args = parse_args()
-    state = State()
-    encrypt_file(args.source, args.dest, state)
-    decrypt_file(args.dest, args.clear, state)
+    cipher = BlockCipher(Cipher(), Nonce())
+
+    origin = FileStorage(args.source)
+    target = FileStorage(args.dest)
+    print('Encrypting')
+    encrypt(origin, target, cipher)
+
+    print('Decrypting')
+    clear = FileStorage(args.clear)
+    decrypt(target, clear, cipher)
 
 
 if __name__ == "__main__":
