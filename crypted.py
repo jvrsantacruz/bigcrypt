@@ -5,10 +5,12 @@ import nacl.secret
 import nacl.utils
 
 import os
+import io
 import sys
 import copy
 import logging
 import mmap
+import hashlib
 from enum import Enum
 from argparse import ArgumentParser
 from pathlib import Path
@@ -16,7 +18,7 @@ from multiprocessing import Pool
 from multiprocessing.pool import ThreadPool
 import fallocate
 import collections
-from typing import Iterator, IO, List, Tuple, Callable, Optional
+from typing import Iterator, IO, List, Tuple, Callable, Optional, Any
 
 _LOGGING_FMT_ = '%(asctime)s %(levelname)-8s %(message)s'
 
@@ -443,17 +445,42 @@ def error(msg, is_exit=True):
         sys.exit()
 
 
+def open_storage(handle: Any) -> Storage:
+    if isinstance(handle, io.IOBase):
+        raise NotImplementedError()
+    elif isinstance(handle, Path):
+        return FileStorage(handle)
+    else:
+        raise NotImplementedError()
+
+
+def open_origin(name: str) -> Storage:
+    if name == '-':
+        handle = sys.stdin
+    else:
+        handle = Path(name)
+    return open_storage(handle)
+
+
+def open_target(name: str) -> Storage:
+    if name == '-':
+        handle = sys.stdin
+    else:
+        handle = Path(name)
+    return open_storage(handle)
+
+
 def parse_args():
     """Parses the command line and checks some values.
     Returns parsed options and positional arguments: (opts, args)"
     """
     parser = ArgumentParser(usage="%(prog)s [options] ARG ARG")
 
-    parser.add_argument("--encrypt", action="store_true")
-    parser.add_argument("source", type=Path)
-    parser.add_argument("dest", type=Path)
-    parser.add_argument("clear", type=Path)
-
+    parser.add_argument("--encrypt", action="store_true", default=False)
+    parser.add_argument("--decrypt", action="store_true", default=False)
+    parser.add_argument("--key", default="password")
+    parser.add_argument("origin", type=open_origin)
+    parser.add_argument("target", type=open_target)
     parser.add_argument("-v", "--verbose", dest="verbose", action="count",
                         default=0, help="")
 
@@ -464,21 +491,31 @@ def parse_args():
     level = logging_levels[args.verbose if args.verbose < 3 else 2]
     logging.basicConfig(level=level, format=_LOGGING_FMT_)
 
+    if not (args.encrypt or args.decrypt):
+        error('Either --encrypt or --decrypt options are mandatory')
+    elif args.encrypt and args.decrypt:
+        error('Options --encrypt or --decrypt are mutually exclusive')
+
     return args
 
 
 def main():
     args = parse_args()
-    cipher = BlockCipher(Cipher(), Nonce())
 
-    origin = FileStorage(args.source)
-    target = FileStorage(args.dest)
-    print('Encrypting')
-    encrypt(origin, target, cipher)
+    key = hashlib.sha256(args.key.encode('utf8')).digest()  # 32 bytes
+    cipher = BlockCipher(Cipher(key), Nonce())
 
-    print('Decrypting')
-    clear = FileStorage(args.clear)
-    decrypt(target, clear, cipher)
+    if args.encrypt:
+        logging.info(
+            'Encrypting %s to %s using %s', args.origin, args.target, cipher
+        )
+        encrypt(args.origin, args.target, cipher)
+
+    if args.decrypt:
+        logging.info(
+            'Decrypting %s to %s using %s', args.origin, args.target, cipher
+        )
+        decrypt(args.origin, args.target, cipher)
 
 
 if __name__ == "__main__":
