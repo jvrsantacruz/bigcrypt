@@ -410,33 +410,80 @@ class Mode(Enum):
     decrypting = 2
 
 
-def encrypt(origin: Storage, target: Storage, cipher: Cipher):
-    origin = DecryptedSource(origin, cipher)
-    target = EncryptedSource(target, cipher, origin)
-    return encrypter(origin, target, Mode.encrypting)
+class Context:
+    def __init__(
+        self,
+        mode: Mode,
+        cipher: Cipher,
+        origin: Storage,
+        target: Storage,
+    ):
+        self.mode = mode
+        self.cipher = cipher
+        self.origin_storage = origin
+        self.target_storage = target
 
+    @property
+    def origin(self) -> Storage:
+        if self.mode == Mode.encrypting:
+            return DecryptedSource(self.origin_storage, self.cipher)
+        else:
+            return EncryptedSource(self.origin_storage, self.cipher)
 
-def decrypt(origin: Storage, target: Storage, cipher: Cipher):
-    origin = EncryptedSource(origin, cipher)
-    target = DecryptedSource(target, cipher, origin)
-    return encrypter(origin, target, Mode.decrypting)
+    @property
+    def target(self) -> Storage:
+        if self.mode == Mode.encrypting:
+            return EncryptedSource(
+                self.target_storage, self.cipher, origin=self.origin
+            )
+        else:
+            return DecryptedSource(
+                self.target_storage, self.cipher, origin=self.origin
+            )
 
+    @property
+    def reader(self) -> Chunker:
+        def _reader(origin: Source) -> Iterator[Block]:
+            with origin.stream('rb') as origin_stream:
+                chunker = MappedChunker(origin.block_size)
+                yield from chunker(origin_stream)
 
-def encrypter(origin: Source, target: Source, mode: Mode):
-    chunker = MappedChunker(origin.block_size)
+        return _reader
 
-    with origin.stream('rb') as source_stream:
-        blocks = chunker(source_stream)
+    @property
+    def crypt(self):
+        return self.cipher.encrypt \
+            if self.mode == Mode.encrypting \
+            else self.cipher.decrypt
 
-        with target.stream('wb+') as dest_stream:
-            writer = MappedWriter(dest_stream, target.size)
-            function = origin.cipher.encrypt \
-                if mode == Mode.encrypting else origin.cipher.decrypt
-            actions = Actions([function, writer])
-            processor = BlockProcessor(actions)
-            blocks = processor(blocks)
-            blocks = map(printer, blocks)
-            consume(blocks)
+    @property
+    def encrypter(self):
+        def _encrypter(blocks: Iterator[Block]) -> Iterator[Block]:
+            with self.target.stream('wb+') as target_stream:
+                writer = MappedWriter(target_stream, self.target.size)
+                processor = BlockProcessor(Actions([self.crypt, writer]))
+                yield from processor(blocks)
+
+        return _encrypter
+
+    @property
+    def writer(self) -> Writer:
+        def _writer(
+            blocks: Iterator[Block], target: Source
+        ) -> Iterator[Block]:
+            return map(printer, blocks)
+
+        return _writer
+
+    def execute(self):
+        logging.info(
+            '%s %s to %s using %s',
+            self.mode, self.origin, self.target, self.cipher
+        )
+        blocks = self.reader(self.origin)
+        blocks = self.encrypter(blocks)
+        blocks = self.writer(blocks, self.target)
+        consume(blocks)
 
 
 def error(msg, is_exit=True):
@@ -496,6 +543,8 @@ def parse_args():
     elif args.encrypt and args.decrypt:
         error('Options --encrypt or --decrypt are mutually exclusive')
 
+    args.mode = Mode.encrypting if args.encrypt else Mode.decrypting
+
     return args
 
 
@@ -505,17 +554,8 @@ def main():
     key = hashlib.sha256(args.key.encode('utf8')).digest()  # 32 bytes
     cipher = BlockCipher(Cipher(key), Nonce())
 
-    if args.encrypt:
-        logging.info(
-            'Encrypting %s to %s using %s', args.origin, args.target, cipher
-        )
-        encrypt(args.origin, args.target, cipher)
-
-    if args.decrypt:
-        logging.info(
-            'Decrypting %s to %s using %s', args.origin, args.target, cipher
-        )
-        decrypt(args.origin, args.target, cipher)
+    context = Context(args.mode, cipher, args.origin, args.target)
+    context.execute()
 
 
 if __name__ == "__main__":
