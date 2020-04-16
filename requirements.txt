@@ -1,2 +1,3 @@
 pynacl
 fallocate
+cached_property

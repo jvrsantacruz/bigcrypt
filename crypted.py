@@ -3,6 +3,7 @@
 """Large file encryption"""
 import nacl.secret
 import nacl.utils
+from cached_property import cached_property
 
 import os
 import io
@@ -294,15 +295,15 @@ class Storage:
     max_blocks = None
 
     def stream(self, *args, **kwargs) -> IO[bytes]:
-        pass
+        raise NotImplementedError()
 
     @property
-    def block_size(self):
-        return
+    def block_size(self) -> int:
+        raise NotImplementedError()
 
     @property
-    def size(self):
-        return
+    def size(self) -> Optional[int]:
+        return None
 
 
 class S3Storage(Storage):
@@ -339,13 +340,13 @@ class Source:
     def size(self) -> Optional[int]:
         raise NotImplementedError()
 
-    @property
+    @cached_property
     def total_blocks(self) -> Optional[int]:
         if self.size is not None:
             return self.size // self.block_size +\
                 0 if self.size % self.block_size == 0 else 1
 
-    @property
+    @cached_property
     def total_overhead(self) -> Optional[int]:
         if self.total_blocks is not None:
             return self.total_blocks * self.cipher.block_overhead
@@ -361,13 +362,13 @@ class EncryptedSource(Source):
         super().__init__(storage, cipher)
         self.origin = origin
 
-    @property
+    @cached_property
     def block_size(self) -> int:
         if not self.origin:
             return self.default_block_size
         return self.origin.block_size + self.cipher.block_overhead
 
-    @property
+    @cached_property
     def size(self) -> Optional[int]:
         if not self.origin:
             return self.storage.size
@@ -385,14 +386,14 @@ class DecryptedSource(Source):
         super().__init__(storage, cipher)
         self.origin = origin
 
-    @property
+    @cached_property
     def block_size(self) -> int:
         base_size = self.default_block_size
         if self.origin:
             base_size = self.origin.block_size
         return base_size - self.cipher.block_overhead
 
-    @property
+    @cached_property
     def size(self) -> Optional[int]:
         if not self.origin:
             return self.storage.size
@@ -423,23 +424,21 @@ class Context:
         self.origin_storage = origin
         self.target_storage = target
 
-    @property
+    @cached_property
     def origin(self) -> Storage:
         if self.mode == Mode.encrypting:
             return DecryptedSource(self.origin_storage, self.cipher)
-        else:
-            return EncryptedSource(self.origin_storage, self.cipher)
+        return EncryptedSource(self.origin_storage, self.cipher)
 
-    @property
+    @cached_property
     def target(self) -> Storage:
         if self.mode == Mode.encrypting:
             return EncryptedSource(
                 self.target_storage, self.cipher, origin=self.origin
             )
-        else:
-            return DecryptedSource(
-                self.target_storage, self.cipher, origin=self.origin
-            )
+        return DecryptedSource(
+            self.target_storage, self.cipher, origin=self.origin
+        )
 
     @property
     def reader(self) -> Chunker:
@@ -450,7 +449,7 @@ class Context:
 
         return _reader
 
-    @property
+    @cached_property
     def crypt(self):
         return self.cipher.encrypt \
             if self.mode == Mode.encrypting \
