@@ -25,10 +25,11 @@ _LOGGING_FMT_ = '%(asctime)s %(levelname)-8s %(message)s'
 
 
 class MemoryRegistry:
-    """Global map of mmaps to avoid pickling
+    """Global registry of maps to avoid pickling objects
 
+The mmap objects are not pickable and thus usable in queues.
 Threads and child processes should have the reference too.
-Be sure register your maps BEFORE starting children processes.
+Be sure to register your maps BEFORE starting child processes.
     """
     def __init__(self, objs=None):
         self.objs = objs or {}
@@ -41,11 +42,16 @@ Be sure register your maps BEFORE starting children processes.
         self.objs.setdefault(obj_id, mem)
         return obj_id
 
+    def __repr__(self) -> str:
+        return f'MemoryRegistry(objs={set(self.objs)})'
+
 
 memory_registry = MemoryRegistry()
 
 
 class Block:
+    """Basic encryption unit"""
+
     def __init__(self, n: int, size: int, block_size: int, data: bytes):
         self.n = n
         self.size = size
@@ -57,10 +63,16 @@ class Block:
 
 
 class MemoryBlock(Block):
-    pass
+    """Block that keeps the data in memory"""
 
 
 class MappedBlock(Block):
+    """Memory mapped block
+
+The contents of the block are stored in an open mmap.
+This requires the file to exist and to be exactly the right size.
+The memory registry is used to make instances picklable.
+    """
     def __init__(
         self,
         n: int,
@@ -80,7 +92,7 @@ class MappedBlock(Block):
             self.data = data
 
     @property
-    def _mem(self) -> Block:
+    def _mem(self) -> mmap.mmap:
         return memory_registry[self._mem_id]
 
     @property
@@ -92,15 +104,22 @@ class MappedBlock(Block):
         self._mem[self._offset:self._offset + self.size] = data
 
 
-class Chunker:
+class Reader:
+    """Create blocks from a given stream"""
+
     def __init__(self, block_size: int):
         self.block_size = block_size
 
-    def __call__(self, stream) -> Iterator[Block]:
-        pass
+    def __call__(self, stream: IO[bytes]) -> Iterator[Block]:
+        raise NotImplementedError()
+
+    def __repr__(self):
+        return f'{type(self).__name__}(block_size={self.block_size})'
 
 
-class StreamChunker(Chunker):
+class StreamChunker(Reader):
+    """Create blocks from a file handler"""
+
     def __call__(self, stream: IO[bytes]) -> Iterator[MemoryBlock]:
         n = 0
         data = stream.read(self.block_size)
@@ -112,7 +131,13 @@ class StreamChunker(Chunker):
             n += 1
 
 
-class MappedChunker(Chunker):
+class MappedReader(Reader):
+    """Create memory mapped blocks from a file handler
+
+This requires the file to exist in the filesystem and to know it's full size.
+A mmap is created for the file and registered at the MemoryRegistry.
+    """
+
     def __call__(self, stream: IO[bytes]) -> Iterator[MappedBlock]:
         fileno = stream.fileno()
         mem = mmap.mmap(fileno, 0, mmap.MAP_SHARED, mmap.PROT_READ)
@@ -143,8 +168,14 @@ class MappedChunker(Chunker):
             n = n + 1 if n else 0
             yield n, last_block_size
 
+    def __repr__(self):
+        return f'type(self).__name__('\
+            'block_size={self.block_size},mem={self.mem_id})'
+
 
 class Nonce:
+    """Representation of a cryptographic nonce"""
+
     def __init__(self, nonce=None, size=None):
         self.size = size or \
             (nonce and len(nonce)) or \
@@ -153,10 +184,13 @@ class Nonce:
         self._number = int.from_bytes(self.value, sys.byteorder)
 
     def next(self, n: int) -> bytes:
+        """Generate a unique number for every presented block"""
         return (self._number + n).to_bytes(self.size, sys.byteorder)
 
 
 class Cipher:
+    """Cyptographic functions to encrypt and decrypt bytes"""
+
     def __init__(self, key=None):
         self.key = key or nacl.utils.random(nacl.secret.SecretBox.KEY_SIZE)
         self.box = nacl.secret.SecretBox(self.key)
@@ -168,8 +202,13 @@ class Cipher:
     def decrypt(self, message: bytes):
         return self.box.decrypt(message)
 
+    def __repr__(self):
+        return f'Cipher()'
+
 
 class BlockCipher:
+    """Adapter to encrypt data in blocks"""
+
     def __init__(self, cipher: Cipher, nonce: Nonce):
         self.cipher = cipher
         self.nonce = nonce
@@ -196,11 +235,16 @@ class BlockCipher:
             data=decrypted,
         )
 
+    def __repr__(self):
+        return f'BlockCipher(cipher={self.cipher})'
+
 
 Action = Callable[[Block], Optional[Block]]
 
 
 class Actions:
+    """Collection of callables"""
+
     def __init__(self, actions: List[Action]):
         self.actions = actions
 
@@ -211,14 +255,24 @@ class Actions:
 
 
 class BlockProcessor:
+    """Process blocks by applying a set of actions"""
     def __init__(self, actions: Actions):
         self.actions = actions
+
+    def __call__(self, blocks: Iterator[Block]) -> Iterator[Optional[Block]]:
+        raise NotImplementedError()
+
+
+class SequentialBlockProcessor(BlockProcessor):
+    """Process blocks one after another"""
 
     def __call__(self, blocks: Iterator[Block]) -> Iterator[Optional[Block]]:
         return (self.actions(block) for block in blocks)
 
 
 class ProcessBlockProcessor(BlockProcessor):
+    """Process blocks using a pool of processes"""
+
     def __init__(self, actions: Actions, pool: Pool=None):
         super().__init__(actions)
         self.pool = pool or Pool(10)
@@ -228,6 +282,8 @@ class ProcessBlockProcessor(BlockProcessor):
 
 
 class ThreadBlockProcessor(BlockProcessor):
+    """Process blocks using a pool of threads"""
+
     def __init__(self, actions: Actions, pool: ThreadPool=None):
         super().__init__(actions)
         self.pool = pool or Pool(10)
@@ -237,14 +293,19 @@ class ThreadBlockProcessor(BlockProcessor):
 
 
 class Writer:
-    def __call__(self, block: Block) -> Block:
-        pass
+    """Write a single block into an storage"""
 
-    def map(self, blocks: Iterator[Block]) -> Iterator[Block]:
-        return map(self, blocks)
+    def __call__(self, block: Block) -> Block:
+        raise NotImplementedError()
 
 
 class FileWriter(Writer):
+    """Write a single block into a given file
+
+It stores the path instead of the file handler to avoid problems while
+writing in child processes.
+    """
+
     def __init__(self, path: Path):
         self.path = path
 
@@ -256,9 +317,16 @@ class FileWriter(Writer):
 
 
 class MappedWriter(Writer):
+    """Memory mapped writer
+
+It writes the block into an existing file via memory map.
+The total size must be known and the file should be already of the target size.
+    """
+
     def __init__(self, stream: IO[bytes], total_size: int):
         fileno = stream.fileno()
-        # Make sure the target file is the right size
+        # Make sure the target file is of the right size without
+        # taking up the space, the file it's just a big "hole"
         fallocate.fallocate(fileno, 0, total_size)
         self.mem_id = memory_registry.add(
             mmap.mmap(fileno, total_size, mmap.MAP_SHARED, mmap.PROT_WRITE)
@@ -275,6 +343,13 @@ class MappedWriter(Writer):
 
 
 class MappedAnonWriter(Writer):
+    """Memory mapped writer into memory
+
+It saves the block into an anonymous memory region.
+Total size must be known, but the file is not persisted.
+This is useful to pass the memory among processes.
+    """
+
     def __init__(self, total_size: int):
         mem = mmap.mmap(
             -1, total_size, mmap.SHARED, mmap.PROT_READ | mmap.PROT_WRITE
@@ -283,34 +358,47 @@ class MappedAnonWriter(Writer):
 
 
 def printer(block: Block) -> Block:
+    """Action of printing a single block for debug"""
     print(block)
     return block
 
 
 def consume(iterable):
+    """Efficiently iterate over a sequence discarding the results"""
     collections.deque(iterable, maxlen=0)
 
 
 class Storage:
+    """Data storage representation
+
+It abstracts the different possible data devices.
+
+This should always be able to open a byte stream from the underlaying resource.
+Total size might not be available for pipes and streams.
+The max_blocks represents possible limitations in the amount of blocks that can
+be processed.
+    """
     max_blocks = None
 
     def stream(self, *args, **kwargs) -> IO[bytes]:
         raise NotImplementedError()
 
     @property
-    def block_size(self) -> int:
-        raise NotImplementedError()
-
-    @property
     def size(self) -> Optional[int]:
         return None
 
+    def __repr__(self):
+        return f'{type(self).__name__}()'
+
 
 class S3Storage(Storage):
+    """Represents an existing S3 file"""
     max_blocks = 10000
 
 
 class FileStorage(Storage):
+    """Represents an existing or not file in the filesystem"""
+
     def __init__(self, path: Path):
         self.path = path
 
@@ -321,8 +409,18 @@ class FileStorage(Storage):
     def size(self) -> int:
         return self.path.stat().st_size
 
+    def __repr__(self):
+        return f'{type(self).__name__}(path={self.path})'
+
 
 class Source:
+    """Represents an encrypted data source or destination
+
+It's a wrapper over Storage objects that own the data
+but adding the needed features for encryption and decryption.
+
+As with the Storage, the size might not be available.
+    """
     default_block_size = 64 * 2**20 # 64 MiB
 
     def __init__(self, storage: Storage, cipher: Cipher):
@@ -351,8 +449,16 @@ class Source:
         if self.total_blocks is not None:
             return self.total_blocks * self.cipher.block_overhead
 
+    def __repr__(self):
+        return f'{type(self).__name__}('\
+            f'storage={self.storage},cipher={self.cipher})'
+
 
 class EncryptedSource(Source):
+    """Represents an encrypted data source
+
+It is assumed that the contents of the storage are encrypted using cipher.
+    """
     def __init__(
         self,
         storage: Storage,
@@ -364,19 +470,32 @@ class EncryptedSource(Source):
 
     @cached_property
     def block_size(self) -> int:
+        # Use the "round" default block size for the encrypted file
+        # Optimize io block size for the encrypted version
         if not self.origin:
             return self.default_block_size
+
+        # Take the plain block size and add the encrypting overhead
+        # This overhead is due to the validation tag and the nonce
         return self.origin.block_size + self.cipher.block_overhead
 
     @cached_property
     def size(self) -> Optional[int]:
         if not self.origin:
             return self.storage.size
-        return self.origin.size + \
-            self.origin.total_blocks * self.origin.total_overhead
+
+        # Calculate the encrypted total size by adding the accumulated overhead
+        # to the size of the plain version of the data
+        if self.origin.size is not None:
+            return self.origin.size + \
+                self.origin.total_blocks * self.origin.total_overhead
 
 
 class DecryptedSource(Source):
+    """Represents the plain version of the data source
+
+It calculates the sizes for using cipher to encrypt it.
+    """
     def __init__(
         self,
         storage: Storage,
@@ -391,27 +510,34 @@ class DecryptedSource(Source):
         base_size = self.default_block_size
         if self.origin:
             base_size = self.origin.block_size
+
+        # Plain size is "not round" as it expressed as
+        # the encrypted block without the cipher overhead.
         return base_size - self.cipher.block_overhead
 
     @cached_property
     def size(self) -> Optional[int]:
         if not self.origin:
             return self.storage.size
-        return self.origin.size -\
-            self.origin.total_blocks * self.cipher.block_overhead
 
-
-class Status(Enum):
-    origin = 1
-    target = 2
+        # The total size of the plain data is the encrypted size
+        # without the accumulated cipher overhead
+        if self.origin.size is not None:
+            return self.origin.size -\
+                self.origin.total_blocks * self.cipher.block_overhead
 
 
 class Mode(Enum):
-    encrypting = 1
-    decrypting = 2
+    ENCRYPT = 1
+    DECRYPT = 2
+
+    def __str__(self):
+        return 'Encrypt' if self == Mode.ENCRYPT else 'Decrypt'
 
 
 class Context:
+    """Encryption context holds together everything needef for the process"""
+
     def __init__(
         self,
         mode: Mode,
@@ -425,14 +551,14 @@ class Context:
         self.target_storage = target
 
     @cached_property
-    def origin(self) -> Storage:
-        if self.mode == Mode.encrypting:
+    def origin(self) -> Source:
+        if self.mode == Mode.ENCRYPT:
             return DecryptedSource(self.origin_storage, self.cipher)
         return EncryptedSource(self.origin_storage, self.cipher)
 
     @cached_property
-    def target(self) -> Storage:
-        if self.mode == Mode.encrypting:
+    def target(self) -> Source:
+        if self.mode == Mode.ENCRYPT:
             return EncryptedSource(
                 self.target_storage, self.cipher, origin=self.origin
             )
@@ -441,10 +567,10 @@ class Context:
         )
 
     @property
-    def reader(self) -> Chunker:
+    def reader(self) -> Reader:
         def _reader(origin: Source) -> Iterator[Block]:
             with origin.stream('rb') as origin_stream:
-                chunker = MappedChunker(origin.block_size)
+                chunker = MappedReader(origin.block_size)
                 yield from chunker(origin_stream)
 
         return _reader
@@ -452,7 +578,7 @@ class Context:
     @cached_property
     def crypt(self):
         return self.cipher.encrypt \
-            if self.mode == Mode.encrypting \
+            if self.mode == Mode.ENCRYPT \
             else self.cipher.decrypt
 
     @property
@@ -460,7 +586,9 @@ class Context:
         def _encrypter(blocks: Iterator[Block]) -> Iterator[Block]:
             with self.target.stream('wb+') as target_stream:
                 writer = MappedWriter(target_stream, self.target.size)
-                processor = BlockProcessor(Actions([self.crypt, writer]))
+                processor = SequentialBlockProcessor(Actions([
+                    self.crypt, writer
+                ]))
                 yield from processor(blocks)
 
         return _encrypter
@@ -475,10 +603,7 @@ class Context:
         return _writer
 
     def execute(self):
-        logging.info(
-            '%s %s to %s using %s',
-            self.mode, self.origin, self.target, self.cipher
-        )
+        logging.info('%s %s to %s', self.mode, self.origin, self.target)
         blocks = self.reader(self.origin)
         blocks = self.encrypter(blocks)
         blocks = self.writer(blocks, self.target)
@@ -492,6 +617,7 @@ def error(msg, is_exit=True):
 
 
 def open_storage(handle: Any) -> Storage:
+    """Create a Storage object from low level data resource"""
     if isinstance(handle, io.IOBase):
         raise NotImplementedError()
     elif isinstance(handle, Path):
@@ -501,6 +627,7 @@ def open_storage(handle: Any) -> Storage:
 
 
 def open_origin(name: str) -> Storage:
+    """Open a data resource from a string identifier to read from"""
     if name == '-':
         handle = sys.stdin
     else:
@@ -509,6 +636,7 @@ def open_origin(name: str) -> Storage:
 
 
 def open_target(name: str) -> Storage:
+    """Open a data resource from a string identifier to write to"""
     if name == '-':
         handle = sys.stdin
     else:
@@ -522,13 +650,24 @@ def parse_args():
     """
     parser = ArgumentParser(usage="%(prog)s [options] ARG ARG")
 
-    parser.add_argument("--encrypt", action="store_true", default=False)
-    parser.add_argument("--decrypt", action="store_true", default=False)
-    parser.add_argument("--key", default="password")
+    parser.add_argument(
+        "--encrypt", action="store_true", default=False,
+        help="Convert a plain data version into an encrypted one"
+    )
+    parser.add_argument(
+        "--decrypt", action="store_true", default=False,
+        help="Take back an encrypted version into a plain one"
+    )
+    parser.add_argument(
+        "-v", "--verbose", dest="verbose", action="count", default=0,
+        help="Use repeated times to increase the verbosity"
+    )
+    parser.add_argument(
+        "--key", default="password",
+        help="Arbitrary string used as cipher key for encryption/decryption"
+    )
     parser.add_argument("origin", type=open_origin)
     parser.add_argument("target", type=open_target)
-    parser.add_argument("-v", "--verbose", dest="verbose", action="count",
-                        default=0, help="")
 
     args = parser.parse_args()
 
@@ -542,7 +681,7 @@ def parse_args():
     elif args.encrypt and args.decrypt:
         error('Options --encrypt or --decrypt are mutually exclusive')
 
-    args.mode = Mode.encrypting if args.encrypt else Mode.decrypting
+    args.mode = Mode.ENCRYPT if args.encrypt else Mode.DECRYPT
 
     return args
 
