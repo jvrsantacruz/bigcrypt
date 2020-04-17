@@ -203,8 +203,7 @@ This requires the file to exist in the filesystem and to know it's full size.
 A mmap is created for the file and registered at the MemoryRegistry.
     """
     def iter_storage(self, storage: FileStorage) -> Iterator[MappedBlock]:
-        with storage.stream('rb+') as stream:
-            yield from self(stream)
+        return self(storage.stream('rb+'))
 
     def __call__(self, stream: IO[bytes]) -> Iterator[MappedBlock]:
         fileno = stream.fileno()
@@ -354,7 +353,7 @@ class ThreadBlockProcessor(BlockProcessor):
 
     def __init__(self, actions: Actions, pool: ThreadPool=None):
         super().__init__(actions)
-        self.pool = pool or Pool(10)
+        self.pool = pool or ThreadPool(10)
 
     def __call__(self, blocks: Iterator[Block]) -> Iterator[Optional[Block]]:
         return self.pool.imap_unordered(self.actions, blocks)
@@ -369,6 +368,9 @@ class Writer:
     def map(self, blocks: Iterator[Block]) -> Iterator[Block]:
         return map(self, blocks)
 
+    def __repr__(self):
+        return f'{type(self).__name__}()'
+
 
 class FileWriter(Writer):
     """Write a single block into a given file
@@ -376,7 +378,7 @@ class FileWriter(Writer):
 It stores the path instead of the file handler to avoid problems while
 writing in child processes.
     """
-    @property
+    @classmethod
     def from_storage(cls, storage: FileStorage) -> Writer:
         return cls(storage.path)
 
@@ -396,6 +398,9 @@ writing in child processes.
         stream.seek(block.n * block.block_size)
         stream.write(block.data)
         return block
+
+    def __repr__(self):
+        return f'{type(self).__name__}({self.path})'
 
 
 class StreamWriter(Writer):
@@ -423,6 +428,9 @@ Worst case is that they come in reverse order, all blocks being queued.
                 n += 1
                 yield heappop(heap)
 
+    def __repr__(self):
+        return f'{type(self).__name__}({self._stream})'
+
 
 class MappedWriter(Writer):
     """Memory mapped writer
@@ -430,6 +438,10 @@ class MappedWriter(Writer):
 It writes the block into an existing file via memory map.
 The total size must be known and the file should be already of the target size.
     """
+    @classmethod
+    def from_storage(cls, storage: FileStorage, total_size: int) -> Writer:
+        return cls(storage.path.open('wb+'), total_size)
+
     def __init__(self, stream: IO[bytes], total_size: int):
         fileno = stream.fileno()
         # Make sure the target file is of the right size without
@@ -448,20 +460,29 @@ The total size must be known and the file should be already of the target size.
             mem=memory_registry[self.mem_id],
         )
 
+    def __repr__(self):
+        return f'{type(self).__name__}({self.mem_id})'
 
-class MappedAnonWriter(Writer):
+
+class MappedAnonWriter(MappedWriter):
     """Memory mapped writer into memory
 
 It saves the block into an anonymous memory region.
 Total size must be known, but the file is not persisted.
 This is useful to pass the memory among processes.
     """
+    @classmethod
+    def from_storage(cls, storage: FileStorage, total_size: int) -> Writer:
+        return cls(total_size)
 
     def __init__(self, total_size: int):
         mem = mmap.mmap(
             -1, total_size, mmap.SHARED, mmap.PROT_READ | mmap.PROT_WRITE
         )
         self.mem_id = memory_registry.add(mem)
+
+    def __repr__(self):
+        return f'{type(self).__name__}({self.mem_id})'
 
 
 def printer(block: Block) -> Block:
@@ -596,20 +617,30 @@ class Mode(Enum):
         return 'Encrypt' if self == Mode.ENCRYPT else 'Decrypt'
 
 
+class Engine(Enum):
+    SEQUENTIAL = 1
+    PROCESS = 2
+    THREADS = 3
+
+
 class Context:
     """Encryption context holds together everything needef for the process"""
 
     def __init__(
         self,
         mode: Mode,
+        engine: Engine,
         cipher: Cipher,
         origin: Storage,
         target: Storage,
+        pool_size: int = None,
     ):
         self.mode = mode
+        self.engine = engine
         self.cipher = cipher
         self.origin_storage = origin
         self.target_storage = target
+        self.pool_size = pool_size
 
     @cached_property
     def origin(self) -> Source:
@@ -627,7 +658,7 @@ class Context:
             self.target_storage, self.cipher, origin=self.origin
         )
 
-    @property
+    @cached_property
     def reader(self) -> Reader:
         storage = self.origin.storage
         block_size = self.origin.block_size
@@ -645,27 +676,67 @@ class Context:
             if self.mode == Mode.ENCRYPT \
             else self.cipher.decrypt
 
-    @property
+    @cached_property
     def encrypter(self):
-        return SequentialBlockProcessor(Actions([self.crypt]))
+        if self.engine == Engine.SEQUENTIAL:
+            return SequentialBlockProcessor(Actions([self.crypt]))
+        elif self.engine == Engine.THREADS:
+            return ThreadBlockProcessor(
+                Actions([self.crypt]), ThreadPool(self.pool_size)
+            )
+        elif self.engine == Engine.PROCESS:
+            actions = [self.crypt]
 
-    @property
+            # If we're writing to a file, better to make the
+            # same subprocess write to it to avoid passing
+            # the data back and forth between parent and children
+            if isinstance(self.target.storage, FileStorage):
+                if self.origin.size is None:
+                    actions.append(
+                        FileWriter.from_storage(self.target.storage)
+                    )
+                else:
+                    actions.append(
+                        MappedWriter.from_storage(
+                            self.target.storage, self.target.size
+                        )
+                    )
+
+            # Make sure all mmaps are created before starting the pool
+            return ProcessBlockProcessor(
+                Actions(actions), Pool(self.pool_size)
+            )
+
+        raise NotImplementedError()
+
+    @cached_property
     def writer(self) -> Writer:
+        # Use a phony writer when the process already does that
+        if self.engine.PROCESS and \
+                isinstance(self.target.storage, FileStorage):
+            return self._writer_dummy()
+
         # When we don't know the size we have to stream
-        if isinstance(self.origin.storage, StreamStorage):
+        if self.origin.size is None:
             if isinstance(self.target.storage, FileStorage):
                 return self._writer_file()
             elif isinstance(self.target.storage, StreamStorage):
                 return self._writer_streamed()
 
-        # When we do know the size of the stream
-        elif isinstance(self.origin.storage, FileStorage):
+        # When we know the size, we can use mmap
+        else:
             if isinstance(self.target.storage, FileStorage):
                 return self._writer_mapped()
             elif isinstance(self.target.storage, StreamStorage):
                 return self._writer_streamed()
 
         raise NotImplementedError()
+
+    def _writer_dummy(self):
+        def _writer(blocks: Iterator[Block], target: Source):
+            return iter(blocks)
+
+        return _writer
 
     def _writer_file(self):
         def _writer(blocks: Iterator[Block], target: Source):
@@ -756,6 +827,15 @@ def parse_args():
         help="Arbitrary string used as cipher key for encryption/decryption"
     )
     parser.add_argument(
+        "--engine", default=Engine.PROCESS,
+        choices=[e.name.lower() for e in Engine],
+        help="Parallelization method"
+    )
+    parser.add_argument(
+        "--pool-size", default=5, type=int,
+        help="Number of threads/processes when using parallel processing"
+    )
+    parser.add_argument(
         '-o', "--origin", default=None,
         help='Source of the encrypted/decripted data'
     )
@@ -776,6 +856,7 @@ def parse_args():
         error('Options --encrypt or --decrypt are mutually exclusive')
 
     args.mode = Mode.ENCRYPT if args.encrypt else Mode.DECRYPT
+    args.engine = Engine[args.engine.upper()]
     args.origin = open_origin(args.origin)
     args.target = open_target(args.target)
 
@@ -788,7 +869,14 @@ def main():
     key = hashlib.sha256(args.key.encode('utf8')).digest()  # 32 bytes
     cipher = BlockCipher(Cipher(key), Nonce())
 
-    context = Context(args.mode, cipher, args.origin, args.target)
+    context = Context(
+        mode=args.mode,
+        engine=args.engine,
+        pool_size=args.pool_size,
+        cipher=cipher,
+        origin=args.origin,
+        target=args.target,
+    )
     context.execute()
 
 

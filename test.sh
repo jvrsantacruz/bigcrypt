@@ -1,10 +1,11 @@
 #!/bin/bash -eu
 
-declare -r DEBUG='-v'
+declare -r DEBUG=''
 declare -r KEY='mypassword'
 declare -r ORIGIN='./origin.txt'
 declare -r MIDDLE='./middle.txt'
 declare -r TARGET='./target.txt'
+declare -r ENGINES="sequential threads process"
 
 cat > $ORIGIN  <<EOF
 This is a test
@@ -22,16 +23,16 @@ function assert_equals {
 
 
 function encrypt {
-    ./crypted.py $DEBUG --key $KEY --encrypt $@
+    ./crypted.py $DEBUG --key $KEY --engine $CURRENT_ENGINE --encrypt $@
 }
 
 function decrypt {
-    ./crypted.py $DEBUG --key $KEY --decrypt $@
+    ./crypted.py $DEBUG --key $KEY --engine $CURRENT_ENGINE --decrypt $@
 }
 
 
 function test_file_origin_or_target() {
-    echo ${FUNCNAME[0]}
+    echo ${FUNCNAME[0]} using $CURRENT_ENGINE
 
     encrypt --origin $ORIGIN --target $MIDDLE
     decrypt --origin $MIDDLE --target $TARGET
@@ -40,7 +41,7 @@ function test_file_origin_or_target() {
 }
 
 function test_streamed_origin_or_target() {
-    echo ${FUNCNAME[0]}
+    echo ${FUNCNAME[0]} using $CURRENT_ENGINE
 
     cat $ORIGIN | encrypt --target $MIDDLE
     decrypt --origin $MIDDLE > $TARGET
@@ -49,7 +50,7 @@ function test_streamed_origin_or_target() {
 }
 
 function test_streamed_origin_and_target() {
-    echo ${FUNCNAME[0]}
+    echo ${FUNCNAME[0]} using $CURRENT_ENGINE
 
     cat $ORIGIN | encrypt | decrypt > $TARGET
 
@@ -57,7 +58,9 @@ function test_streamed_origin_and_target() {
 }
 
 
-test_file_origin_or_target
-test_streamed_origin_or_target
-test_streamed_origin_and_target
+for CURRENT_ENGINE in $ENGINES; do
+    test_file_origin_or_target
+    test_streamed_origin_or_target
+    test_streamed_origin_and_target
+done
 echo "OK!"
