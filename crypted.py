@@ -13,6 +13,7 @@ import logging
 import mmap
 import hashlib
 from enum import Enum
+from heapq import heappush, heappop
 from argparse import ArgumentParser
 from pathlib import Path
 from multiprocessing import Pool
@@ -57,6 +58,9 @@ class Block:
         self.size = size
         self.block_size = block_size
         self.data = data
+
+    def __lt__(self, other: 'Block') -> bool:
+        return self.n < other.n
 
     def __repr__(self):
         return f'{type(self).__name__}(n={self.n},size={self.size})'
@@ -104,11 +108,69 @@ The memory registry is used to make instances picklable.
         self._mem[self._offset:self._offset + self.size] = data
 
 
+class Storage:
+    """Data storage representation
+
+It abstracts the different possible data devices.
+
+This should always be able to open a byte stream from the underlaying resource.
+Total size might not be available for pipes and streams.
+The max_blocks represents possible limitations in the amount of blocks that can
+be processed.
+    """
+    max_blocks = None
+
+    def stream(self, *args, **kwargs) -> IO[bytes]:
+        raise NotImplementedError()
+
+    @property
+    def size(self) -> Optional[int]:
+        return None
+
+    def __repr__(self):
+        return f'{type(self).__name__}()'
+
+
+class S3Storage(Storage):
+    """Represents an existing S3 file"""
+    max_blocks = 10000
+
+
+class FileStorage(Storage):
+    """Represents a file in the filesystem"""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def stream(self, *args, **kwargs) -> IO[bytes]:
+        return self.path.open(*args, **kwargs)
+
+    @property
+    def size(self) -> int:
+        return self.path.stat().st_size
+
+    def __repr__(self):
+        return f'{type(self).__name__}(path={self.path})'
+
+
+class StreamStorage(Storage):
+    """Represents an existing open file"""
+
+    def __init__(self, stream: IO[bytes]):
+        self._stream = stream
+
+    def stream(self) -> IO[bytes]:
+        return self._stream
+
+
 class Reader:
     """Create blocks from a given stream"""
 
     def __init__(self, block_size: int):
         self.block_size = block_size
+
+    def iter_storage(self, storage: Storage) -> Iterator[Block]:
+        raise NotImplementedError()
 
     def __call__(self, stream: IO[bytes]) -> Iterator[Block]:
         raise NotImplementedError()
@@ -117,8 +179,11 @@ class Reader:
         return f'{type(self).__name__}(block_size={self.block_size})'
 
 
-class StreamChunker(Reader):
+class StreamReader(Reader):
     """Create blocks from a file handler"""
+
+    def iter_storage(self, storage: StreamStorage) -> Iterator[MemoryBlock]:
+        yield from self(storage.stream())
 
     def __call__(self, stream: IO[bytes]) -> Iterator[MemoryBlock]:
         n = 0
@@ -137,6 +202,9 @@ class MappedReader(Reader):
 This requires the file to exist in the filesystem and to know it's full size.
 A mmap is created for the file and registered at the MemoryRegistry.
     """
+    def iter_storage(self, storage: FileStorage) -> Iterator[MappedBlock]:
+        with storage.stream('rb+') as stream:
+            yield from self(stream)
 
     def __call__(self, stream: IO[bytes]) -> Iterator[MappedBlock]:
         fileno = stream.fileno()
@@ -298,6 +366,9 @@ class Writer:
     def __call__(self, block: Block) -> Block:
         raise NotImplementedError()
 
+    def map(self, blocks: Iterator[Block]) -> Iterator[Block]:
+        return map(self, blocks)
+
 
 class FileWriter(Writer):
     """Write a single block into a given file
@@ -305,15 +376,52 @@ class FileWriter(Writer):
 It stores the path instead of the file handler to avoid problems while
 writing in child processes.
     """
+    @property
+    def from_storage(cls, storage: FileStorage) -> Writer:
+        return cls(storage.path)
 
     def __init__(self, path: Path):
         self.path = path
 
     def __call__(self, block: Block) -> Block:
-        with self.path.open('rb+') as stream:
-            stream.seek(block.n * block.block_size)
-            stream.write(block.data)
+        with self.path.open('wb') as stream:
+            return self._write(block, stream)
+
+    def map(self, blocks: Iterator[Block]) -> Iterator[Block]:
+        with self.path.open('wb') as stream:
+            for block in blocks:
+                yield self._write(block, stream)
+
+    def _write(self, block: Block, stream: IO[bytes]) -> Block:
+        stream.seek(block.n * block.block_size)
+        stream.write(block.data)
         return block
+
+
+class StreamWriter(Writer):
+    """Write blocks into a stream, in order"""
+    def __init__(self, stream: IO[bytes]):
+        self._stream = stream
+
+    def map(self, blocks: Iterator[Block]) -> Iterator[Block]:
+        return (
+            self._stream.write(block.data)
+            for block in self._blocks_in_order(blocks)
+        )
+
+    def _blocks_in_order(self, blocks: Iterator[Block]) -> Iterator[Block]:
+        """Sort the blocks as they come
+
+It will keep a buffer of blocks if they don't come in order.
+Worst case is that they come in reverse order, all blocks being queued.
+        """
+        n = 0
+        heap = []
+        for block in blocks:
+            heappush(heap, block)
+            while heap and heap[0].n == n:
+                n += 1
+                yield heappop(heap)
 
 
 class MappedWriter(Writer):
@@ -322,7 +430,6 @@ class MappedWriter(Writer):
 It writes the block into an existing file via memory map.
 The total size must be known and the file should be already of the target size.
     """
-
     def __init__(self, stream: IO[bytes], total_size: int):
         fileno = stream.fileno()
         # Make sure the target file is of the right size without
@@ -368,51 +475,6 @@ def consume(iterable):
     collections.deque(iterable, maxlen=0)
 
 
-class Storage:
-    """Data storage representation
-
-It abstracts the different possible data devices.
-
-This should always be able to open a byte stream from the underlaying resource.
-Total size might not be available for pipes and streams.
-The max_blocks represents possible limitations in the amount of blocks that can
-be processed.
-    """
-    max_blocks = None
-
-    def stream(self, *args, **kwargs) -> IO[bytes]:
-        raise NotImplementedError()
-
-    @property
-    def size(self) -> Optional[int]:
-        return None
-
-    def __repr__(self):
-        return f'{type(self).__name__}()'
-
-
-class S3Storage(Storage):
-    """Represents an existing S3 file"""
-    max_blocks = 10000
-
-
-class FileStorage(Storage):
-    """Represents an existing or not file in the filesystem"""
-
-    def __init__(self, path: Path):
-        self.path = path
-
-    def stream(self, *args, **kwargs):
-        return self.path.open(*args, **kwargs)
-
-    @property
-    def size(self) -> int:
-        return self.path.stat().st_size
-
-    def __repr__(self):
-        return f'{type(self).__name__}(path={self.path})'
-
-
 class Source:
     """Represents an encrypted data source or destination
 
@@ -450,8 +512,7 @@ As with the Storage, the size might not be available.
             return self.total_blocks * self.cipher.block_overhead
 
     def __repr__(self):
-        return f'{type(self).__name__}('\
-            f'storage={self.storage},cipher={self.cipher})'
+        return f'{type(self).__name__}({self.storage},{self.cipher})'
 
 
 class EncryptedSource(Source):
@@ -568,12 +629,15 @@ class Context:
 
     @property
     def reader(self) -> Reader:
-        def _reader(origin: Source) -> Iterator[Block]:
-            with origin.stream('rb') as origin_stream:
-                chunker = MappedReader(origin.block_size)
-                yield from chunker(origin_stream)
+        storage = self.origin.storage
+        block_size = self.origin.block_size
 
-        return _reader
+        if isinstance(storage, StreamStorage):
+            return StreamReader(block_size)
+        elif isinstance(storage, FileStorage):
+            return MappedReader(block_size)
+        else:
+            raise NotImplementedError()
 
     @cached_property
     def crypt(self):
@@ -583,28 +647,53 @@ class Context:
 
     @property
     def encrypter(self):
-        def _encrypter(blocks: Iterator[Block]) -> Iterator[Block]:
-            with self.target.stream('wb+') as target_stream:
-                writer = MappedWriter(target_stream, self.target.size)
-                processor = SequentialBlockProcessor(Actions([
-                    self.crypt, writer
-                ]))
-                yield from processor(blocks)
-
-        return _encrypter
+        return SequentialBlockProcessor(Actions([self.crypt]))
 
     @property
     def writer(self) -> Writer:
-        def _writer(
-            blocks: Iterator[Block], target: Source
-        ) -> Iterator[Block]:
-            return map(printer, blocks)
+        # When we don't know the size we have to stream
+        if isinstance(self.origin.storage, StreamStorage):
+            if isinstance(self.target.storage, FileStorage):
+                return self._writer_file()
+            elif isinstance(self.target.storage, StreamStorage):
+                return self._writer_streamed()
+
+        # When we do know the size of the stream
+        elif isinstance(self.origin.storage, FileStorage):
+            if isinstance(self.target.storage, FileStorage):
+                return self._writer_mapped()
+            elif isinstance(self.target.storage, StreamStorage):
+                return self._writer_streamed()
+
+        raise NotImplementedError()
+
+    def _writer_file(self):
+        def _writer(blocks: Iterator[Block], target: Source):
+            yield from FileWriter(target.storage.path).map(blocks)
+
+        return _writer
+
+    def _writer_streamed(self):
+        def _writer(blocks: Iterator[Block], target: Source):
+            yield from StreamWriter(target.storage.stream()).map(blocks)
+
+        return _writer
+
+    def _writer_mapped(self):
+        def _writer(blocks: Iterator[Block], target: Source):
+            with self.target.stream('wb+') as target_stream:
+                writer = MappedWriter(target_stream, self.target.size)
+                yield from map(writer, blocks)
 
         return _writer
 
     def execute(self):
-        logging.info('%s %s to %s', self.mode, self.origin, self.target)
-        blocks = self.reader(self.origin)
+        logging.info(
+            '%s %s to %s using %s',
+            self.mode, self.origin_storage,
+            self.target_storage, self.cipher.cipher
+        )
+        blocks = self.reader.iter_storage(self.origin.storage)
         blocks = self.encrypter(blocks)
         blocks = self.writer(blocks, self.target)
         consume(blocks)
@@ -619,7 +708,7 @@ def error(msg, is_exit=True):
 def open_storage(handle: Any) -> Storage:
     """Create a Storage object from low level data resource"""
     if isinstance(handle, io.IOBase):
-        raise NotImplementedError()
+        return StreamStorage(handle)
     elif isinstance(handle, Path):
         return FileStorage(handle)
     else:
@@ -628,17 +717,17 @@ def open_storage(handle: Any) -> Storage:
 
 def open_origin(name: str) -> Storage:
     """Open a data resource from a string identifier to read from"""
-    if name == '-':
-        handle = sys.stdin
+    if name is None or name == '-':
+        handle = sys.stdin.buffer
     else:
         handle = Path(name)
     return open_storage(handle)
 
 
-def open_target(name: str) -> Storage:
+def open_target(name: Optional[str]) -> Storage:
     """Open a data resource from a string identifier to write to"""
-    if name == '-':
-        handle = sys.stdin
+    if name is None or name == '-':
+        handle = sys.stdout.buffer
     else:
         handle = Path(name)
     return open_storage(handle)
@@ -663,11 +752,16 @@ def parse_args():
         help="Use repeated times to increase the verbosity"
     )
     parser.add_argument(
-        "--key", default="password",
+        "--key", required=True,
         help="Arbitrary string used as cipher key for encryption/decryption"
     )
-    parser.add_argument("origin", type=open_origin)
-    parser.add_argument("target", type=open_target)
+    parser.add_argument(
+        '-o', "--origin", default=None,
+        help='Source of the encrypted/decripted data'
+    )
+    parser.add_argument(
+        '-t', "--target", default=None,
+        help='Destination of the encrypted/decrypted data')
 
     args = parser.parse_args()
 
@@ -682,6 +776,8 @@ def parse_args():
         error('Options --encrypt or --decrypt are mutually exclusive')
 
     args.mode = Mode.ENCRYPT if args.encrypt else Mode.DECRYPT
+    args.origin = open_origin(args.origin)
+    args.target = open_target(args.target)
 
     return args
 
