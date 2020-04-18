@@ -20,11 +20,15 @@ from multiprocessing import Pool
 from multiprocessing.pool import ThreadPool
 import fallocate
 import collections
-from typing import Iterator, IO, List, Tuple, Callable, Optional, Any
+from dataclasses import dataclass, field
+from typing import Iterator, IO, List, Tuple, Callable, Optional, Any, Dict
 
+DEFAULT_POOL_SIZE = 5
+DEFAULT_BLOCK_SIZE = 64 * 2**20 # 64 MiB
 _LOGGING_FMT_ = '%(asctime)s %(levelname)-8s %(message)s'
 
 
+@dataclass
 class MemoryRegistry:
     """Global registry of maps to avoid pickling objects
 
@@ -32,8 +36,7 @@ The mmap objects are not pickable and thus usable in queues.
 Threads and child processes should have the reference too.
 Be sure to register your maps BEFORE starting child processes.
     """
-    def __init__(self, objs=None):
-        self.objs = objs or {}
+    objs: Dict[int, mmap.mmap] = field(default_factory=dict)
 
     def __getitem__(self, obj_id: int) -> mmap.mmap:
         return self.objs[obj_id]
@@ -43,33 +46,25 @@ Be sure to register your maps BEFORE starting child processes.
         self.objs.setdefault(obj_id, mem)
         return obj_id
 
-    def __repr__(self) -> str:
-        return f'MemoryRegistry(objs={set(self.objs)})'
-
 
 memory_registry = MemoryRegistry()
 
 
+@dataclass(eq=True, order=True)
 class Block:
     """Basic encryption unit"""
-
-    def __init__(self, n: int, size: int, block_size: int, data: bytes):
-        self.n = n
-        self.size = size
-        self.block_size = block_size
-        self.data = data
-
-    def __lt__(self, other: 'Block') -> bool:
-        return self.n < other.n
-
-    def __repr__(self):
-        return f'{type(self).__name__}(n={self.n},size={self.size})'
+    n: int = field()
+    size: int = field(compare=False)
+    block_size: int = field(compare=False, repr=False)
+    data: bytes = field(compare=False, repr=False)
 
 
+@dataclass(eq=True, order=True)
 class MemoryBlock(Block):
     """Block that keeps the data in memory"""
 
 
+@dataclass(eq=True, order=True, init=False)
 class MappedBlock(Block):
     """Memory mapped block
 
@@ -127,20 +122,16 @@ be processed.
     def size(self) -> Optional[int]:
         return None
 
-    def __repr__(self):
-        return f'{type(self).__name__}()'
-
 
 class S3Storage(Storage):
     """Represents an existing S3 file"""
     max_blocks = 10000
 
 
+@dataclass
 class FileStorage(Storage):
     """Represents a file in the filesystem"""
-
-    def __init__(self, path: Path):
-        self.path = path
+    path: Path = field()
 
     def stream(self, *args, **kwargs) -> IO[bytes]:
         return self.path.open(*args, **kwargs)
@@ -149,10 +140,8 @@ class FileStorage(Storage):
     def size(self) -> int:
         return self.path.stat().st_size
 
-    def __repr__(self):
-        return f'{type(self).__name__}(path={self.path})'
 
-
+@dataclass(init=False)
 class StreamStorage(Storage):
     """Represents an existing open file"""
 
@@ -163,11 +152,10 @@ class StreamStorage(Storage):
         return self._stream
 
 
+@dataclass()
 class Reader:
     """Create blocks from a given stream"""
-
-    def __init__(self, block_size: int):
-        self.block_size = block_size
+    block_size: int = field()
 
     def iter_storage(self, storage: Storage) -> Iterator[Block]:
         raise NotImplementedError()
@@ -235,14 +223,9 @@ A mmap is created for the file and registered at the MemoryRegistry.
             n = n + 1 if n else 0
             yield n, last_block_size
 
-    def __repr__(self):
-        return f'type(self).__name__('\
-            'block_size={self.block_size},mem={self.mem_id})'
-
 
 class Nonce:
     """Representation of a cryptographic nonce"""
-
     def __init__(self, nonce=None, size=None):
         self.size = size or \
             (nonce and len(nonce)) or \
@@ -340,9 +323,9 @@ class SequentialBlockProcessor(BlockProcessor):
 class ProcessBlockProcessor(BlockProcessor):
     """Process blocks using a pool of processes"""
 
-    def __init__(self, actions: Actions, pool: Pool=None):
+    def __init__(self, actions: Actions, pool: Pool):
         super().__init__(actions)
-        self.pool = pool or Pool(10)
+        self.pool = pool
 
     def __call__(self, blocks: Iterator[Block]) -> Iterator[Optional[Block]]:
         return self.pool.imap_unordered(self.actions, blocks)
@@ -351,9 +334,9 @@ class ProcessBlockProcessor(BlockProcessor):
 class ThreadBlockProcessor(BlockProcessor):
     """Process blocks using a pool of threads"""
 
-    def __init__(self, actions: Actions, pool: ThreadPool=None):
+    def __init__(self, actions: Actions, pool: ThreadPool):
         super().__init__(actions)
-        self.pool = pool or ThreadPool(10)
+        self.pool = pool
 
     def __call__(self, blocks: Iterator[Block]) -> Iterator[Optional[Block]]:
         return self.pool.imap_unordered(self.actions, blocks)
@@ -485,15 +468,18 @@ This is useful to pass the memory among processes.
         return f'{type(self).__name__}({self.mem_id})'
 
 
-def printer(block: Block) -> Block:
-    """Action of printing a single block for debug"""
-    print(block)
-    return block
+@dataclass
+class Sizes:
+    block_overhead: int
+    pool_size: int
+    block_size: int
 
-
-def consume(iterable):
-    """Efficiently iterate over a sequence discarding the results"""
-    collections.deque(iterable, maxlen=0)
+    def validate(self):
+        if self.block_size <= self.block_overhead:
+            raise ValueError(
+                'Bad block_size: encrypted block size cannot be smaller than'
+                f' {self.block_overhead + 1}'
+            )
 
 
 class Source:
@@ -504,11 +490,9 @@ but adding the needed features for encryption and decryption.
 
 As with the Storage, the size might not be available.
     """
-    default_block_size = 64 * 2**20 # 64 MiB
-
-    def __init__(self, storage: Storage, cipher: Cipher):
+    def __init__(self, storage: Storage, sizes: Sizes):
         self.storage = storage
-        self.cipher = cipher
+        self.sizes = sizes
 
     def stream(self, *args, **kwargs):
         return self.storage.stream(*args, **kwargs)
@@ -524,30 +508,32 @@ As with the Storage, the size might not be available.
     @cached_property
     def total_blocks(self) -> Optional[int]:
         if self.size is not None:
-            return self.size // self.block_size +\
-                0 if self.size % self.block_size == 0 else 1
+            return (
+                self.size // self.block_size +
+                (0 if self.size % self.block_size == 0 else 1)
+            )
 
     @cached_property
     def total_overhead(self) -> Optional[int]:
         if self.total_blocks is not None:
-            return self.total_blocks * self.cipher.block_overhead
+            return self.total_blocks * self.sizes.block_overhead
 
     def __repr__(self):
-        return f'{type(self).__name__}({self.storage},{self.cipher})'
+        return f'{type(self).__name__}({self.storage},{self.sizes})'
 
 
 class EncryptedSource(Source):
     """Represents an encrypted data source
 
-It is assumed that the contents of the storage are encrypted using cipher.
+It is assumed that the contents of the storage are encrypted
     """
     def __init__(
         self,
         storage: Storage,
-        cipher: Cipher,
+        sizes: Sizes,
         origin: 'DecryptedSource'=None
     ):
-        super().__init__(storage, cipher)
+        super().__init__(storage, sizes)
         self.origin = origin
 
     @cached_property
@@ -555,47 +541,46 @@ It is assumed that the contents of the storage are encrypted using cipher.
         # Use the "round" default block size for the encrypted file
         # Optimize io block size for the encrypted version
         if not self.origin:
-            return self.default_block_size
+            return self.sizes.block_size
 
         # Take the plain block size and add the encrypting overhead
         # This overhead is due to the validation tag and the nonce
-        return self.origin.block_size + self.cipher.block_overhead
+        return self.origin.block_size + self.sizes.block_overhead
 
     @cached_property
     def size(self) -> Optional[int]:
         if not self.origin:
             return self.storage.size
 
+        # Cannot calculate the size from the original version
+        if self.origin.size is None:
+            return None
+
         # Calculate the encrypted total size by adding the accumulated overhead
         # to the size of the plain version of the data
-        if self.origin.size is not None:
-            return self.origin.size + \
-                self.origin.total_blocks * self.origin.total_overhead
+        return self.origin.size + self.origin.total_overhead
 
 
 class DecryptedSource(Source):
-    """Represents the plain version of the data source
-
-It calculates the sizes for using cipher to encrypt it.
-    """
+    """Represents the plain version of the data source"""
     def __init__(
         self,
         storage: Storage,
-        cipher: Cipher,
+        sizes: Sizes,
         origin: EncryptedSource=None
     ):
-        super().__init__(storage, cipher)
+        super().__init__(storage, sizes)
         self.origin = origin
 
     @cached_property
     def block_size(self) -> int:
-        base_size = self.default_block_size
+        base_size = self.sizes.block_size
         if self.origin:
             base_size = self.origin.block_size
 
         # Plain size is "not round" as it expressed as
         # the encrypted block without the cipher overhead.
-        return base_size - self.cipher.block_overhead
+        return base_size - self.sizes.block_overhead
 
     @cached_property
     def size(self) -> Optional[int]:
@@ -603,10 +588,10 @@ It calculates the sizes for using cipher to encrypt it.
             return self.storage.size
 
         # The total size of the plain data is the encrypted size
-        # without the accumulated cipher overhead
+        # without the accumulated cipher block overhead
         if self.origin.size is not None:
             return self.origin.size -\
-                self.origin.total_blocks * self.cipher.block_overhead
+                self.origin.total_blocks * self.sizes.block_overhead
 
 
 class Mode(Enum):
@@ -633,29 +618,29 @@ class Context:
         cipher: Cipher,
         origin: Storage,
         target: Storage,
-        pool_size: int = None,
+        sizes: Sizes,
     ):
         self.mode = mode
         self.engine = engine
         self.cipher = cipher
         self.origin_storage = origin
         self.target_storage = target
-        self.pool_size = pool_size
+        self.sizes = sizes
 
     @cached_property
     def origin(self) -> Source:
         if self.mode == Mode.ENCRYPT:
-            return DecryptedSource(self.origin_storage, self.cipher)
-        return EncryptedSource(self.origin_storage, self.cipher)
+            return DecryptedSource(self.origin_storage, self.sizes)
+        return EncryptedSource(self.origin_storage, self.sizes)
 
     @cached_property
     def target(self) -> Source:
         if self.mode == Mode.ENCRYPT:
             return EncryptedSource(
-                self.target_storage, self.cipher, origin=self.origin
+                self.target_storage, self.sizes, origin=self.origin
             )
         return DecryptedSource(
-            self.target_storage, self.cipher, origin=self.origin
+            self.target_storage, self.sizes, origin=self.origin
         )
 
     @cached_property
@@ -682,7 +667,7 @@ class Context:
             return SequentialBlockProcessor(Actions([self.crypt]))
         elif self.engine == Engine.THREADS:
             return ThreadBlockProcessor(
-                Actions([self.crypt]), ThreadPool(self.pool_size)
+                Actions([self.crypt]), ThreadPool(self.sizes.pool_size)
             )
         elif self.engine == Engine.PROCESS:
             actions = [self.crypt]
@@ -704,7 +689,7 @@ class Context:
 
             # Make sure all mmaps are created before starting the pool
             return ProcessBlockProcessor(
-                Actions(actions), Pool(self.pool_size)
+                Actions(actions), Pool(self.sizes.pool_size)
             )
 
         raise NotImplementedError()
@@ -712,7 +697,7 @@ class Context:
     @cached_property
     def writer(self) -> Writer:
         # Use a phony writer when the process already does that
-        if self.engine.PROCESS and \
+        if self.engine == self.engine.PROCESS and \
                 isinstance(self.target.storage, FileStorage):
             return self._writer_dummy()
 
@@ -775,6 +760,16 @@ def error(msg, is_exit=True):
     if is_exit:
         sys.exit()
 
+def printer(block: Block) -> Block:
+    """Action of printing a single block for debug"""
+    print(block)
+    return block
+
+
+def consume(iterable):
+    """Efficiently iterate over a sequence discarding the results"""
+    collections.deque(iterable, maxlen=0)
+
 
 def open_storage(handle: Any) -> Storage:
     """Create a Storage object from low level data resource"""
@@ -832,8 +827,13 @@ def parse_args():
         help="Parallelization method"
     )
     parser.add_argument(
-        "--pool-size", default=5, type=int,
-        help="Number of threads/processes when using parallel processing"
+        "--block-size", default=DEFAULT_BLOCK_SIZE, type=int,
+        help=f"Block size bytes for the encrypted data: {DEFAULT_BLOCK_SIZE}"
+    )
+    parser.add_argument(
+        "--pool-size", default=DEFAULT_POOL_SIZE, type=int,
+        help="Number of threads/processes when using parallel processing:"
+        f" {DEFAULT_POOL_SIZE}"
     )
     parser.add_argument(
         '-o', "--origin", default=None,
@@ -869,13 +869,19 @@ def main():
     key = hashlib.sha256(args.key.encode('utf8')).digest()  # 32 bytes
     cipher = BlockCipher(Cipher(key), Nonce())
 
+    sizes = Sizes(
+        pool_size=args.pool_size,
+        block_size=args.block_size,
+        block_overhead=cipher.block_overhead,
+    )
+    sizes.validate()
     context = Context(
         mode=args.mode,
         engine=args.engine,
-        pool_size=args.pool_size,
         cipher=cipher,
         origin=args.origin,
         target=args.target,
+        sizes=sizes,
     )
     context.execute()
 
