@@ -609,7 +609,7 @@ class Engine(Enum):
 
 
 class Context:
-    """Encryption context holds together everything needef for the process"""
+    """Encryption context holds together everything needed for the process"""
 
     def __init__(
         self,
