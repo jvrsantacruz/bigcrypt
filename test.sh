@@ -6,8 +6,8 @@ declare -r KEY='mypassword'
 declare -r ORIGIN='./origin.txt'
 declare -r MIDDLE='./middle.txt'
 declare -r TARGET='./target.txt'
-declare -r MIN_BLOCK_SIZE=41
-declare -r BLOCK_SIZES="$MIN_BLOCK_SIZE 256"
+declare -r MIN_BLOCK_SIZE=1
+declare -r BLOCK_SIZES="$MIN_BLOCK_SIZE 2 22 24 25 51 256"
 declare -r DEFAULT_ENGINE=sequential
 declare -r ENGINES="sequential threads process"
 declare CURRENT_ENGINE=$DEFAULT_ENGINE
@@ -49,15 +49,15 @@ function run() {
     local test="$1"
 
     printf "Running $test\n"
-    printf "Using engine: $CURRENT_ENGINE pass: $CURRENT_PASSWORD"
     setup
+    printf "Using engine: $CURRENT_ENGINE pass: $CURRENT_PASSWORD"
     $test
     cleanup
     printf "\tOK\n"
 }
 
 
-function test_file_origin_or_target() {
+function test_file_origin_and_target() {
     encrypt --origin $ORIGIN --target $MIDDLE
     decrypt --origin $MIDDLE --target $TARGET
 
@@ -79,10 +79,10 @@ function test_streamed_origin_and_target() {
 
 function test_different_block_sizes() {
     echo
-    for BLOCK_SIZE in $BLOCK_SIZES; do
+    for BLOCK_SIZE in 1 40 256;  do
         echo "block size $BLOCK_SIZE"
         encrypt --block-size $BLOCK_SIZE --origin $ORIGIN --target $MIDDLE
-        decrypt --block-size $BLOCK_SIZE --origin $MIDDLE --target $TARGET
+        decrypt --origin $MIDDLE --target $TARGET
 
         assert_equals $ORIGIN $TARGET
     done
@@ -96,7 +96,7 @@ function run_one() {
 
 function run_tests() {
     for CURRENT_ENGINE in $ENGINES; do
-        run test_file_origin_or_target
+        run test_file_origin_and_target
         run test_streamed_origin_or_target
         run test_streamed_origin_and_target
         run test_different_block_sizes
