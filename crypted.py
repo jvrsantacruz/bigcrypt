@@ -549,10 +549,19 @@ class Nonce:
             nacl.secret.SecretBox.NONCE_SIZE
         self.value = nonce or nacl.utils.random(self.size)
         self._number = int.from_bytes(self.value, sys.byteorder)
+        self._max_number = 2 ** self.size
 
     def next(self, n: int) -> bytes:
         """Generate a unique number for every presented block"""
-        return (self._number + n).to_bytes(self.size, sys.byteorder)
+        next_number = (self._number + n) % self._max_number
+        if n > 0 and next_number == self._number:
+            raise ValueError(
+                f'Repeated nonce error: cannot reuse a nonce for block {n} '
+                ' nonces are 24 bits long and only allow for that many '
+                ' blocks to be created. Increase the block size to allow for '
+                ' bigger files.'
+            )
+        return next_number.to_bytes(self.size, sys.byteorder)
 
 
 class Cipher:
