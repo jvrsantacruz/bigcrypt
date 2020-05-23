@@ -163,8 +163,28 @@ file including the header, when available.
                             Destination of the encrypted/decrypted data
     -v, --verbose         Use repeated times to increase the verbosity
 
+## Development
+
+This project uses [pyproject.toml][] and [poetry][] to manage its
+dependencies. Install [poetry][] in your system in order to setup a
+development environment for this project.
+
+Run the tests with:
+
+    poetry run tox
+
+For development, you can try just using more basic operations:
+
+    poetry install
+    poetry run ./test.sh
+
+Use other interpreters by selecting which poetry environment to use:
+
+    poetry env use python3.8
 
 [GIL]: http://man7.org/linux/man-pages/man2/mmap.2.html
 [fallocate]: http://man7.org/linux/man-pages/man2/mmap.2.html
 [mmap]: http://man7.org/linux/man-pages/man2/mmap.2.html
 [message limit]: https://github.com/jedisct1/libsodium/blob/master/src/libsodium/include/sodium/crypto_secretstream_xchacha20poly1305.h#L32
+[poetry]: https://python-poetry.org
+[pyproject.toml]: https://www.python.org/dev/peps/pep-0518/

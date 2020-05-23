@@ -14,15 +14,15 @@ declare CURRENT_ENGINE=$DEFAULT_ENGINE
 declare CURRENT_PASSWORD=
 
 function encrypt {
-    ./crypted.py $DEBUG --key $KEY --engine $CURRENT_ENGINE --encrypt $@
+    bigcrypt $DEBUG --key $KEY --engine $CURRENT_ENGINE --encrypt $@
 }
 
 function decrypt {
-    ./crypted.py $DEBUG --key $KEY --engine $CURRENT_ENGINE --decrypt $@
+    bigcrypt $DEBUG --key $KEY --engine $CURRENT_ENGINE --decrypt $@
 }
 
 function random_password {
-    cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w ${1:-32} | head -n 1
+    head -c 32 /dev/urandom | sha1sum | cut -f 1 -d ' '
 }
 
 function setup {

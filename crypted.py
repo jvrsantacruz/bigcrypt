@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """Large file encryption"""
 import nacl.secret
@@ -948,7 +947,3 @@ def main():
         encrypt(context, args.origin, args.target)
     else:
         decrypt(context, args.origin, args.target)
-
-
-if __name__ == "__main__":
-    main()
